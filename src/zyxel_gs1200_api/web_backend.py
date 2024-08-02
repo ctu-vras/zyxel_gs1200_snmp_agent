@@ -16,10 +16,15 @@ from .types import PacketCounter, Port, PortStatus, Switch
 __all__ = ['WebBackend']
 
 
-def formalize_request(r: requests.Request) -> requests.Request:
+def formalize_request(r):
     r.params.update({"dummy": int(time.time())})
     _, _, _, _, _, query, _ = parse_url(r.prepare().url)
-    r.params.update({"bj4": hashlib.md5(query.encode("utf8")).digest().hex()})
+    digest = hashlib.md5(query.encode("utf8")).digest()
+    try:
+        digest = digest.hex()
+    except AttributeError:  # Python 2
+        digest = digest.encode('hex')
+    r.params.update({"bj4": digest})
     return r
 
 
@@ -100,7 +105,7 @@ class WebBackend(Backend):
         self.session = requests.Session()
         self.logged_in = False
 
-    def send_request(self, method: str, url: str, *args, **kwargs):
+    def send_request(self, method, url, *args, **kwargs):
         """Send a HTTP request to the switch API.
         :param str method: GET or POST
         :param url: The URL part after address.
@@ -191,7 +196,11 @@ class WebBackend(Backend):
 
         key = rsa.PublicKey(n=int(modulus, 16), e=0x10001)
         encrypted = rsa.encrypt(self.password.encode("ascii"), key)
-        enc_pass = base64.encodebytes(encrypted).replace(b"\n", b"").replace(b"+", b"%2B").replace(b"=", b"%3D")
+        try:
+            enc_pass = base64.encodebytes(encrypted)
+        except AttributeError:
+            enc_pass = base64.encodestring(encrypted)
+        enc_pass = enc_pass.replace(b"\n", b"").replace(b"+", b"%2B").replace(b"=", b"%3D")
         enc_pass = enc_pass.decode("ascii")
 
         auth_id = self.set('home_loginAuth',
@@ -238,7 +247,10 @@ class WebBackend(Backend):
         switch.max_mtu = 12288 if switch.model_name.startswith("XGS") else 9000
 
         switch.mac_str = main_data["sys_MAC"].lower()
-        switch.mac_bin = bytes.fromhex(switch.mac_str.replace(":", ""))
+        try:
+            switch.mac_bin = bytes.fromhex(switch.mac_str.replace(":", ""))
+        except AttributeError:  # Python 2
+            switch.mac_bin = switch.mac_str.replace(":", "").decode('hex')
 
         switch.ip_addr = main_data["sys_IP"]
         switch.ip_subnet = main_data["sys_sbnt_msk"]
@@ -305,7 +317,11 @@ class WebBackend(Backend):
 
         switch.device_name = sys_data["sys_dev_name"]
         switch.mac_str = sys_data["sys_MAC"].lower()
-        switch.mac_bin = bytes.fromhex(switch.mac_str.replace(":", ""))
+        try:
+            switch.mac_bin = bytes.fromhex(switch.mac_str.replace(":", ""))
+        except AttributeError:  # Python2
+            switch.mac_bin = switch.mac_str.replace(":", "").decode('hex')
+            
         switch.ip_addr = sys_data["sys_IP"]
         switch.ip_subnet = sys_data["sys_sbnt_msk"]
         switch.ip_gateway = sys_data["sys_gateway"]

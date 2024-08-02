@@ -30,12 +30,17 @@ ROS parameters:
                        `name`: This is an alias of the port reported as `ifAlias` IF-MIB value.
 """
 
+from __future__ import print_function
 
 import platform
 import sys
 import time
 from threading import Thread
-from typing_extensions import override
+try:
+    from typing_extensions import override
+except ImportError:  # Python 2
+    def override(f):
+        return f
 
 from cras import get_param, SteadyRate
 from zyxel_gs1200_api import ZyxelAPI, Port, Switch
