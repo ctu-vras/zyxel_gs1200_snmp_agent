@@ -1,0 +1,46 @@
+<?xml version="1.0"?>
+<!-- SPDX-License-Identifier: BSD-3-Clause -->
+<!-- SPDX-FileCopyrightText: Czech Technical University in Prague -->
+
+<package format="3">
+  <name>zyxel_gs1200_snmp_agent</name>
+  <version>1.0.0</version>
+  <description>Diagnostics for Zyxel (X)GS-1200 Series Ethernet Switches</description>
+
+  <maintainer email="peckama2@fel.cvut.cz">Martin Pecka</maintainer>
+  <author email="peckama2@fel.cvut.cz">Martin Pecka</author>
+
+  <license>BSD</license>
+  
+  <url type="website">https://github.com/ctu-vras/zyxel_gs1200_snmp_agent</url>
+  <url type="bugtracker">https://github.com/ctu-vras/zyxel_gs1200_snmp_agent/issues</url>
+  <url type="repository">https://github.com/ctu-vras/zyxel_gs1200_snmp_agent</url>
+
+  <buildtool_depend>catkin</buildtool_depend>
+  <buildtool_depend condition="$ROS_PYTHON_VERSION == 2">python-setuptools</buildtool_depend>
+  <buildtool_depend condition="$ROS_PYTHON_VERSION == 3">python3-setuptools</buildtool_depend>
+
+  <exec_depend condition="$ROS_PYTHON_VERSION == 3">python3-pysnmp</exec_depend>
+  <exec_depend condition="$ROS_PYTHON_VERSION == 3">python3-pysnmp-mibs</exec_depend>
+  <exec_depend condition="$ROS_PYTHON_VERSION == 3">python3-requests</exec_depend>
+  <exec_depend condition="$ROS_PYTHON_VERSION == 3">python3-rsa</exec_depend>
+  
+  <exec_depend condition="$ROS_PYTHON_VERSION == 2">python-pysnmp</exec_depend>
+  <!--exec_depend condition="$ROS_PYTHON_VERSION == 2">python-pysnmp-mibs</exec_depend-->
+  <exec_depend condition="$ROS_PYTHON_VERSION == 2">python-requests</exec_depend>
+  <!--exec_depend condition="$ROS_PYTHON_VERSION == 2">python-rsa</exec_depend-->
+  
+  <exec_depend>cras_py_common</exec_depend>
+  <exec_depend>rospy</exec_depend>
+  
+  <test_depend condition="$ROS_PYTHON_VERSION == 2">python-catkin-lint</test_depend>
+  <test_depend condition="$ROS_PYTHON_VERSION == 3">python3-catkin-lint</test_depend>
+  <test_depend>roslint</test_depend>
+  
+  <doc_depend>cras_docs_common</doc_depend>
+  <doc_depend>rosdoc_lite</doc_depend>
+  <export>
+      <rosdoc config="rosdoc.yaml"/>
+  </export>
+
+</package>

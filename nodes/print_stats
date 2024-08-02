@@ -1,0 +1,123 @@
+#!/usr/bin/env python
+
+# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-FileCopyrightText: Czech Technical University in Prague
+
+
+"""
+ROS node that uses :class:`ZyxelAPI` to print switch statistics to console.
+
+ROS parameters:
+- `~address` (str): Address of the HTTP API (including 'http://').
+- `~password` (str): Password for the HTTP API.
+- `~rate` (float): Printing frequency in Hz.
+- `~clear_screen` (bool, default False): If true, a clear screen command will be printed before each iteration.
+- `~num_prints` (int, default 0): If nonzero, this is the number of prints after which the node exits.
+- `~demo_port_info` (bool, default False): If true, `~port_info` will be populated with a demonstration content.
+- `~port_info` (dict): Extra configuration of switch ports. Keys are port names (e.g. `GigabitEthernet1`) and values
+                       are dicts. These dicts can contain the following keys:
+                       `name`: This is an alias of the port reported as `ifAlias` IF-MIB value.
+                       `speed`: Desired speed of the port in bps. If the runtime speed is different, an error is
+                                printed.
+"""
+
+
+from __future__ import print_function
+
+import rospy
+
+from cras import get_param, SteadyRate
+from zyxel_gs1200_api import ZyxelAPI
+
+
+if_speed_names = {
+    10000000: "10 Mbps",
+    100000000: "100 Mbps",
+    1000000000: "1 Gbps",
+    2500000000: "2.5 Gbps",
+    5000000000: "5 Gbps",
+    10000000000: "10 Gbps",
+}
+
+
+rospy.init_node("print_stats", disable_rostime=True)
+argv = rospy.myargv()
+
+if rospy.has_param("~address"):
+    address = get_param("~address")
+    password = get_param("~password", "")
+elif len(argv) >= 2:
+    address = argv[1]
+    password = argv[2] if len(argv) > 2 else ''
+else:
+    raise RuntimeError("Switch address has to be provided.")
+
+
+rate = SteadyRate(get_param("~rate", 0.2, "Hz"))
+clear_screen = get_param("~clear_screen", False)
+num_prints = get_param("~num_prints", 0)
+port_info = get_param("~port_info", {})
+demo_port_info = get_param("~demo_port_info", False)
+
+if demo_port_info:
+    port_info = {
+        "GigabitEthernet5":             {"name": "Bullet", "speed": 1000000000},
+        "GigabitEthernet6":             {"name": "Cam 6", "speed": 1000000000},
+        "GigabitEthernet7":             {"name": "Cam 7", "speed": 1000000000},
+        "GigabitEthernet8":             {"name": "Top Box"},
+        "TwoPointFiveGigabitEthernet1": {"name": "IEI", "speed": 1000000000},
+        "TwoPointFiveGigabitEthernet2": {"name": "NUC", "speed": 1000000000},
+        "TenGigabitEthernet1":          {"name": "Jetson", "speed": 10000000000},
+    }
+
+
+with ZyxelAPI(address, password) as api:
+    switch = api.get_switch()
+    rospy.loginfo("Connected to " + switch.description)
+
+    num_ports = switch.num_ports
+    for i in range(num_ports):
+        port = switch.ports[i]
+        info = port_info.get(port.name, {})
+        port.alias = info.get("name", port.name)
+
+    print_nr = 0
+    while not rospy.is_shutdown():
+        api.update_port_states(switch)
+
+        if clear_screen:
+            print("\033c", end="")
+
+        if any([p.status.loop_detected for p in switch.ports]):
+            print("Loop detected!")
+
+        max_port_name_len = max(4, max([len(p.alias) for p in switch.ports]))
+
+        print("------------------------------------------------" + ("-" * max_port_name_len))
+        print(("%" + str(max_port_name_len) + "s |  status  | Rx (kpkts) | Tx (kpkts) |  loop  | ") % ("port",))
+        for i in range(num_ports):
+            port = switch.ports[i]
+            port_info = port_info[port.name] if port.name in port_info else {}
+            speed_err = ""
+            if "speed" in port_info:
+                if not port.status.connected:
+                    speed_err = "!PORT DOWN!"
+                elif port.status.speed != port_info["speed"]:
+                    speed_err = "!WRONG SPEED!"
+            if port.status.overheat_detected:
+                speed_err = "!OVERHEAT!"
+
+            print(("%" + str(max_port_name_len) + "s | %08s | %10i | %10i | %06s | %s") % (
+                  port.alias,
+                  "Down" if not port.status.connected else if_speed_names[port.status.speed],
+                  port.status.rx_packets.num_unicast_packets / 1000,
+                  port.status.tx_packets.num_unicast_packets / 1000,
+                  port.status.loop_detected,
+                  speed_err))
+
+        print_nr += 1
+        # noinspection PyChainedComparisons
+        if num_prints > 0 and print_nr >= num_prints:
+            break
+
+        rate.sleep()

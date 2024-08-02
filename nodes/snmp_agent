@@ -1,0 +1,331 @@
+#!/usr/bin/env python
+
+# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-FileCopyrightText: Czech Technical University in Prague
+
+
+"""
+ROS node that uses :class:`ZyxelAPI` to provide an external SNMP agent for the switch.
+
+ROS parameters:
+- `~address` (str): Address of the HTTP API (including 'http://').
+- `~password` (str): Password for the HTTP API.
+- `~update_rate` (float): Polling frequency.
+- `~snmp_port` (int, default 1161): Port at which the SNMP agent will be available. Note that ROS is not compatible with
+                                    running as root, so ports under 1024 are not available.
+- `~snmp_listen_ipv4` (str, default '0.0.0.0'): Listening IPv4 address of the SNMP server. If empty, IPv4 is disabled.
+- `~snmp_listen_ipv6` (str, default '::'): Listening IPv6 address of the SNMP server. If empty, IPv6 is disabled.
+- `~snmpv1` (bool, default True): Whether to provide SNMPv1.
+- `~snmpv2c` (bool, default True): Whether to provide SNMPv2c.
+- `~snmpv3` (bool, default True): Whether to provide SNMPv3.
+- `~snmp_community` (str, default 'public'): The SNMP community name.
+- `~snmpv3_user` (str, default 'public'): The SNMPv3 user name.
+- `~snmpv3_auth` (str, default 'usmNoAuthProtocol'): The SNMPv3 authentication protocol. One of `pysnmp.entity.config`.
+- `~snmpv3_priv` (str, default 'usmNoPrivProtocol'): The SNMPv3 privacy protocol. One of `pysnmp.entity.config`.
+- `~snmpv3_auth_key` (str, optional): If set, this is the SNMPv3 auth key.
+- `~snmpv3_priv_key` (str, optional): If set, this is the SNMPv3 priv key.
+- `~demo_port_info` (bool, default False): If true, `~port_info` will be populated with a demonstration content.
+- `~port_info` (dict): Extra configuration of switch ports. Keys are port names (e.g. `GigabitEthernet1`) and values
+                       are dicts. These dicts can contain the following keys:
+                       `name`: This is an alias of the port reported as `ifAlias` IF-MIB value.
+"""
+
+
+import platform
+import sys
+import time
+from threading import Thread
+from typing_extensions import override
+
+from cras import get_param, SteadyRate
+from zyxel_gs1200_api import ZyxelAPI, Port, Switch
+
+from pysnmp.carrier.asyncore.dispatch import AsyncoreDispatcher
+from pysnmp.carrier.asyncore.dgram import udp, udp6
+from pysnmp.entity import engine, config
+from pysnmp.entity.rfc3413 import cmdrsp, context
+
+import rospy
+
+
+stopped = False
+
+
+class StoppableAsyncoreDispatcher(AsyncoreDispatcher):
+    @override
+    def transportsAreWorking(self):
+        if stopped or rospy.is_shutdown():
+            return False
+        return super(StoppableAsyncoreDispatcher, self).transportsAreWorking()
+
+    @override
+    def jobsArePending(self):
+        if stopped or rospy.is_shutdown():
+            return False
+        return super(StoppableAsyncoreDispatcher, self).jobsArePending()
+
+
+rospy.init_node("snmp_agent", disable_rostime=True)
+argv = rospy.myargv()
+
+if rospy.has_param("~address"):
+    address = get_param("~address")
+    password = get_param("~password", "")
+elif len(argv) >= 2:
+    address = argv[1]
+    password = argv[2] if len(argv) > 2 else ''
+else:
+    raise RuntimeError("Switch address has to be provided.")
+
+
+rate = SteadyRate(get_param("~update_rate", 0.5, "Hz"))
+port_info = get_param("~port_info", {})
+
+snmp_port = get_param("~snmp_port", 1161)
+snmp_listen_ipv4 = get_param("~snmp_listen_ipv4", "0.0.0.0")
+snmp_listen_ipv6 = get_param("~snmp_listen_ipv6", "::")
+
+snmpv1 = get_param("~snmpv1", True)
+snmpv2c = get_param("~snmpv2c", True)
+snmpv3 = get_param("~snmpv3", True)
+
+community = get_param("~snmp_community", "public")
+v3user = get_param("~snmpv3_user", "public")
+v3auth = get_param("~snmpv3_auth", "usmNoAuthProtocol")
+v3priv = get_param("~snmpv3_priv", "usmNoPrivProtocol")
+
+v3authkey = None
+if rospy.has_param("~snmpv3_auth_key"):
+    v3authkey = rospy.get_param("~snmpv3_auth_key")
+
+v3privkey = None
+if rospy.has_param("~snmpv3_priv_key"):
+    v3privkey = rospy.get_param("~snmpv3_priv_key")
+
+demo_port_info = get_param("~demo_port_info", False)
+if demo_port_info:
+    port_info = {
+        "GigabitEthernet5":             {"name": "Bullet"},
+        "GigabitEthernet6":             {"name": "Cam 6"},
+        "GigabitEthernet7":             {"name": "Cam 7"},
+        "GigabitEthernet8":             {"name": "Top Box"},
+        "TwoPointFiveGigabitEthernet1": {"name": "IEI"},
+        "TwoPointFiveGigabitEthernet2": {"name": "NUC"},
+        "TenGigabitEthernet1":          {"name": "Jetson"},
+    }
+
+
+snmpEngine = engine.SnmpEngine()
+snmpEngine.registerTransportDispatcher(StoppableAsyncoreDispatcher())
+
+if len(snmp_listen_ipv4) > 0:
+    config.addTransport(snmpEngine, udp.domainName, udp.UdpTransport().openServerMode((snmp_listen_ipv4, snmp_port)))
+if len(snmp_listen_ipv6) > 0:
+    config.addTransport(snmpEngine, udp6.domainName, udp6.Udp6Transport().openServerMode((snmp_listen_ipv6, snmp_port)))
+
+if snmpv1 or snmpv2c:
+    config.addV1System(snmpEngine, 'my-area', community)
+
+if snmpv3:
+    config.addV3User(snmpEngine, v3user,
+                     authProtocol=getattr(config, v3auth), authKey=v3authkey,
+                     privProtocol=getattr(config, v3priv), privKey=v3privkey)
+
+if snmpv1:
+    config.addRoUser(snmpEngine, 1, 'my-area', 'noAuthNoPriv', (1, 3, 6))
+if snmpv2c:
+    config.addRoUser(snmpEngine, 2, 'my-area', 'noAuthNoPriv', (1, 3, 6))
+if snmpv3:
+    config.addRoUser(snmpEngine, 3, community, 'noAuthNoPriv', (1, 3, 6))
+
+snmpContext = context.SnmpContext(snmpEngine)
+mibInstrum = snmpContext.getMibInstrum()
+mibBuilder = mibInstrum.getMibBuilder()
+
+(Integer32, MibScalarInstance) = mibBuilder.importSymbols('SNMPv2-SMI', 'Integer32', 'MibScalarInstance')
+
+(
+    sysDescr, sysName, sysLocation, sysServices
+) = mibBuilder.importSymbols('SNMPv2-MIB',
+    'sysDescr', 'sysName', 'sysLocation', 'sysServices'  # noqa: E128
+)  # noqa: E124
+
+# Import instances of the variables
+mibBuilder.importSymbols('__SNMPv2-MIB',
+    'sysDescr', 'sysName', 'sysLocation', 'sysServices'  # noqa: E128
+)  # noqa: E124
+
+(
+    ifNumber, ifTable, ifEntry, ifIndex, ifDescr, ifType, ifMtu, ifSpeed, ifPhysAddress,
+    ifAdminStatus, ifOperStatus, ifLastChange,
+    ifInOctets, ifInUcastPkts, ifInNUcastPkts, ifInDiscards, ifInErrors, ifInUnknownProtos,
+    ifOutOctets, ifOutUcastPkts, ifOutNUcastPkts, ifOutDiscards, ifOutErrors, ifOutQLen,
+    ifSpecific,
+    ifXTable, ifXEntry, ifName,
+    ifInMulticastPkts, ifInBroadcastPkts, ifOutMulticastPkts, ifOutBroadcastPkts,
+    ifHCInOctets, ifHCInUcastPkts, ifHCInMulticastPkts, ifHCInBroadcastPkts,
+    ifHCOutOctets, ifHCOutUcastPkts, ifHCOutMulticastPkts, ifHCOutBroadcastPkts,
+    ifLinkUpDownTrapEnable, ifHighSpeed, ifPromiscuousMode, ifConnectorPresent, ifAlias,
+    ifCounterDiscontinuityTime
+) = mibBuilder.importSymbols('IF-MIB',
+    'ifNumber', 'ifTable', 'ifEntry', 'ifIndex', 'ifDescr', 'ifType', 'ifMtu', 'ifSpeed', 'ifPhysAddress',  # noqa: E128
+    'ifAdminStatus', 'ifOperStatus', 'ifLastChange',  # noqa: E128
+    'ifInOctets', 'ifInUcastPkts', 'ifInNUcastPkts', 'ifInDiscards', 'ifInErrors', 'ifInUnknownProtos',  # noqa: E128
+    'ifOutOctets', 'ifOutUcastPkts', 'ifOutNUcastPkts', 'ifOutDiscards', 'ifOutErrors', 'ifOutQLen',  # noqa: E128
+    'ifSpecific',  # noqa: E128
+    'ifXTable', 'ifXEntry', 'ifName',  # noqa: E128
+    'ifInMulticastPkts', 'ifInBroadcastPkts', 'ifOutMulticastPkts', 'ifOutBroadcastPkts',  # noqa: E128
+    'ifHCInOctets', 'ifHCInUcastPkts', 'ifHCInMulticastPkts', 'ifHCInBroadcastPkts',  # noqa: E128
+    'ifHCOutOctets', 'ifHCOutUcastPkts', 'ifHCOutMulticastPkts', 'ifHCOutBroadcastPkts',  # noqa: E128
+    'ifLinkUpDownTrapEnable', 'ifHighSpeed', 'ifPromiscuousMode', 'ifConnectorPresent', 'ifAlias',  # noqa: E128
+    'ifCounterDiscontinuityTime',  # noqa: E128
+)  # noqa: E124
+
+# Create instance of ifNumber
+mibBuilder.exportSymbols('IF-MIB', MibScalarInstance(ifNumber.name, (0,), Integer32()))
+
+# We do not want to fill out ifTestEntry
+del ifEntry.augmentingRows[("IF-MIB", "ifTestEntry")]
+
+# Register SNMP Applications at the SNMP engine for particular SNMP context
+cmdrsp.GetCommandResponder(snmpEngine, snmpContext)
+cmdrsp.NextCommandResponder(snmpEngine, snmpContext)
+cmdrsp.BulkCommandResponder(snmpEngine, snmpContext)
+
+start_time = time.time()
+
+
+def run_dispatcher():
+    snmpEngine.transportDispatcher.jobStarted(1)
+    while not stopped and not rospy.is_shutdown():
+        try:
+            snmpEngine.transportDispatcher.runDispatcher(timeout=1.0)
+        except Exception as e:
+            print(e, file=sys.stderr)
+    snmpEngine.transportDispatcher.closeDispatcher()
+
+
+with ZyxelAPI(address, password) as api:
+    switch = api.get_switch()
+    rospy.loginfo("Connected to " + switch.description)
+
+    num_ports = switch.num_ports
+
+    mibInstrum.writeVars((
+        (sysDescr.name + (0,), switch.description),
+        (sysLocation.name + (0,), platform.node()),
+        (sysName.name + (0,), switch.device_name),
+        (sysServices.name + (0,), (2 << (2 - 1))),  # OSI layer 2
+    ))
+
+    mibInstrum.writeVars(((ifNumber.name + (0,), num_ports),))
+
+    for i in range(num_ports):
+        ifInstanceId = ifEntry.getInstIdFromIndices(i + 1)
+
+        port = switch.ports[i]
+        info = port_info.get(port.name, {})
+        port.alias = info.get("name", port.name)
+
+        mibInstrum.writeVars((
+            (ifIndex.name + ifInstanceId, i + 1),
+            (ifDescr.name + ifInstanceId, port.name),
+            (ifType.name + ifInstanceId, "ethernetCsmacd"),
+            (ifMtu.name + ifInstanceId, port.mtu),
+            (ifSpeed.name + ifInstanceId, min(port.max_speed, 4294967295)),
+            (ifPhysAddress.name + ifInstanceId, port.mac_bin),
+            (ifAdminStatus.name + ifInstanceId, "up" if port.status.enabled else "down"),
+            (ifOperStatus.name + ifInstanceId, "down"),
+            (ifLastChange.name + ifInstanceId, 0),
+            (ifInOctets.name + ifInstanceId, 0),
+            (ifInUcastPkts.name + ifInstanceId, 0),
+            (ifInNUcastPkts.name + ifInstanceId, 0),
+            (ifInDiscards.name + ifInstanceId, 0),
+            (ifInErrors.name + ifInstanceId, 0),
+            (ifInUnknownProtos.name + ifInstanceId, 0),
+            (ifOutOctets.name + ifInstanceId, 0),
+            (ifOutUcastPkts.name + ifInstanceId, 0),
+            (ifOutNUcastPkts.name + ifInstanceId, 0),
+            (ifOutDiscards.name + ifInstanceId, 0),
+            (ifOutErrors.name + ifInstanceId, 0),
+            (ifOutQLen.name + ifInstanceId, 0),
+            (ifSpecific.name + ifInstanceId, (0, 0)),
+        ))
+
+        ifXInstanceId = ifXEntry.getInstIdFromIndices(i + 1)
+        mibInstrum.writeVars((
+            (ifName.name + ifXInstanceId, port.short_name),
+            (ifInMulticastPkts.name + ifXInstanceId, 0),
+            (ifInBroadcastPkts.name + ifXInstanceId, 0),
+            (ifOutMulticastPkts.name + ifXInstanceId, 0),
+            (ifOutBroadcastPkts.name + ifXInstanceId, 0),
+            (ifHCInOctets.name + ifXInstanceId, 0),
+            (ifHCInUcastPkts.name + ifXInstanceId, 0),
+            (ifHCInMulticastPkts.name + ifXInstanceId, 0),
+            (ifHCInBroadcastPkts.name + ifXInstanceId, 0),
+            (ifHCOutOctets.name + ifXInstanceId, 0),
+            (ifHCOutUcastPkts.name + ifXInstanceId, 0),
+            (ifHCOutMulticastPkts.name + ifXInstanceId, 0),
+            (ifHCOutBroadcastPkts.name + ifXInstanceId, 0),
+            (ifLinkUpDownTrapEnable.name + ifXInstanceId, 1),
+            (ifHighSpeed.name + ifXInstanceId, int(port.max_speed / 1000000)),
+            (ifPromiscuousMode.name + ifXInstanceId, 'false'),
+            (ifConnectorPresent.name + ifXInstanceId, 'false'),
+            (ifAlias.name + ifXInstanceId, port.alias),
+            (ifCounterDiscontinuityTime.name + ifXInstanceId, 0),
+        ))
+
+    snmp_thread = Thread(target=run_dispatcher)
+    snmp_thread.start()
+
+    iteration = 0
+    while not rospy.is_shutdown():
+        try:
+            if iteration % 30 == 29:
+                api.update_switch_config(switch)
+            api.update_port_states(switch)
+
+            for i in range(switch.num_ports):
+                status = switch.ports[i].status
+
+                oper_status = "down"
+                if status.enabled:
+                    oper_status = "up" if status.connected else "dormant"
+                last_change = (time.time() - status.last_change_time) if status.last_change_time != 0 else 0
+
+                ifInstanceId = ifEntry.getInstIdFromIndices(i + 1)
+                mibInstrum.writeVars((
+                    (ifSpeed.name + ifInstanceId, min(status.speed, 4294967295)),
+                    (ifOperStatus.name + ifInstanceId, oper_status),
+                    (ifLastChange.name + ifInstanceId, int(last_change * 100)),
+                    (ifInUcastPkts.name + ifInstanceId, status.rx_packets.num_unicast_packets),
+                    (ifInNUcastPkts.name + ifInstanceId,
+                     status.rx_packets.num_multicast_packets + status.rx_packets.num_broadcast_packets),
+                    (ifInDiscards.name + ifInstanceId, status.rx_packets.num_discards),
+                    (ifInErrors.name + ifInstanceId, status.rx_packets.num_errors),
+                    (ifOutUcastPkts.name + ifInstanceId, status.tx_packets.num_unicast_packets),
+                    (ifOutNUcastPkts.name + ifInstanceId,
+                     status.tx_packets.num_multicast_packets + status.tx_packets.num_broadcast_packets),
+                    (ifOutDiscards.name + ifInstanceId, status.tx_packets.num_discards),
+                    (ifOutErrors.name + ifInstanceId, status.tx_packets.num_errors),
+                ))
+
+                mibInstrum.writeVars((
+                    (ifHCInUcastPkts.name + ifInstanceId, status.rx_packets.num_unicast_packets),
+                    (ifHCInMulticastPkts.name + ifInstanceId, status.rx_packets.num_multicast_packets),
+                    (ifHCInBroadcastPkts.name + ifInstanceId, status.rx_packets.num_broadcast_packets),
+                    (ifHCOutUcastPkts.name + ifInstanceId, status.tx_packets.num_unicast_packets),
+                    (ifHCOutMulticastPkts.name + ifInstanceId, status.tx_packets.num_multicast_packets),
+                    (ifHCOutBroadcastPkts.name + ifInstanceId, status.tx_packets.num_broadcast_packets),
+                    (ifHighSpeed.name + ifInstanceId, int(status.speed / 1000000)),
+                    (ifConnectorPresent.name + ifInstanceId, "true" if status.connected else "false"),
+                ))
+            rate.sleep()
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            print(e, file=sys.stderr)
+            # continue working as long as we can
+
+    stopped = True
+    snmp_thread.join()
